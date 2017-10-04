@@ -22,7 +22,6 @@ import (
 	"net"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/cilium/cilium/common/addressing"
@@ -52,36 +51,6 @@ const (
 	eventQueueBufferSize = 100
 )
 
-// containerEvents holds per-container queues for events
-type containerEvents struct {
-	sync.Mutex
-	events map[string]chan dTypesEvents.Message
-}
-
-func (ce *containerEvents) enqueueByContainerID(e dTypesEvents.Message) {
-	ce.Lock()
-	defer ce.Unlock()
-
-	if _, found := ce.events[e.Actor.ID]; !found {
-		q := make(chan dTypesEvents.Message, eventQueueBufferSize)
-		ce.events[e.Actor.ID] = q
-		go processContainerEvents(e.Actor.ID, q)
-	}
-	ce.events[e.Actor.ID] <- e
-}
-
-func (ce *containerEvents) reapEmpty() {
-	ce.Lock()
-	defer ce.Unlock()
-
-	for id, q := range ce.events {
-		if len(q) == 0 {
-			close(q)
-			delete(ce.events, id)
-		}
-	}
-}
-
 func shortContainerID(id string) string {
 	return id[:10]
 }
@@ -89,45 +58,65 @@ func shortContainerID(id string) string {
 // EnableEventListener watches for docker events. Performs the plumbing for the
 // containers started or dead.
 func EnableEventListener() error {
-	eventQueue := containerEvents{events: make(map[string]chan dTypesEvents.Message)}
 	since := time.Now()
-	syncWithRuntime()
-
-	eo := dTypes.EventsOptions{Since: strconv.FormatInt(since.Unix(), 10)}
-	r, err := dockerClient.Events(ctx.Background(), eo)
-	if err != nil {
+	ws := newWatcherState()
+	syncWithRuntime(ws, since)
+	if err := startEventListener(ws, since); err != nil {
 		return err
 	}
-
-	go listenForDockerEvents(&eventQueue, r)
 
 	// start a go routine which periodically synchronizes containers
 	// managed by the local container runtime and checks if any of them
 	// need to be managed by Cilium. This is a fall back mechanism in case
 	// an event notification has been lost.
 	go func() {
+		currentWatcherState := ws // inherit this from EnableEventListener's scope
 		for {
 			time.Sleep(syncRateDocker)
-			syncWithRuntime()
+			since := time.Now()
+			newWS := newWatcherState()
+			if outOfSync := syncWithRuntime(newWS, since); outOfSync {
+				log.Debugf("Out of sync, restarting containerd watcher with fresh state")
+				stopEventListener(currentWatcherState)
+				currentWatcherState = newWS
+				startEventListener(newWS, since)
+				return
+			}
 
 			log.Debug("Reaping empty event queues")
-			eventQueue.reapEmpty()
+			currentWatcherState.reapEmpty()
 		}
 	}()
 
+	return nil
+}
+
+// startEventListener begins listening and handling events for this
+// watcherState. Multiple watcherStates can be running but it is expecting that
+// only one runs at a time.
+func startEventListener(ws *watcherState, since time.Time) error {
+	eo := dTypes.EventsOptions{Since: strconv.FormatInt(since.Unix(), 10)}
+	r, err := dockerClient.Events(ctx.Background(), eo)
+	if err != nil {
+		return err
+	}
+
+	go listenForDockerEvents(ws, r)
 	log.Debugf("Started to listen for containerd events")
 
 	return nil
 }
 
+// stopEventListener shuts down all handlers and event readers attached to this watcherState.
+func stopEventListener(ws *watcherState) {
+	ws.close()
+}
+
 // syncWithRuntime is used by the daemon to synchronize changes between Docker and
 // Cilium. This includes identities, labels, etc.
-func syncWithRuntime() {
-	var wg sync.WaitGroup
-
-	// FIXME GH-1662: Must be synchronize with event handler
-
-	cList, err := dockerClient.ContainerList(ctx.Background(), dTypes.ContainerListOptions{All: false})
+// outOfSync indicates if we saw an unexpected container, indicating we may have missed events
+func syncWithRuntime(ws *watcherState, since time.Time) (outOfSync bool) {
+	cList, err := dockerClient.ContainerList(ctx.Background(), dTypes.ContainerListOptions{All: false, Since: strconv.FormatInt(since.Unix(), 10)})
 	if err != nil {
 		log.Errorf("Failed to retrieve the container list %s", err)
 	}
@@ -136,24 +125,25 @@ func syncWithRuntime() {
 			continue
 		}
 
-		wg.Add(1)
-		go func(wg *sync.WaitGroup, id string) {
-			log.WithFields(log.Fields{
-				logfields.ContainerID: shortContainerID(id),
-			}).Debug("Periodic synchronization of container")
+		outOfSync = true
+		log.WithFields(log.Fields{
+			logfields.ContainerID: shortContainerID(cont.ID),
+		}).Debug("Periodic synchronization of container")
 
-			handleCreateContainer(id, false)
-			wg.Done()
-		}(&wg, cont.ID)
+		ws.startEventHandler(cont.ID)
+		handleCreateContainer(cont.ID, false)
 	}
 
-	// Wait for all spawned go routines handling container creations to exit
-	wg.Wait()
+	return
 }
 
-func listenForDockerEvents(eventQueue *containerEvents, reader io.ReadCloser) {
+func listenForDockerEvents(ws *watcherState, reader io.ReadCloser) {
 	scanner := bufio.NewScanner(reader)
 	for scanner.Scan() {
+		if ws.isClosed() {
+			return
+		}
+
 		var e dTypesEvents.Message
 		if err := json.Unmarshal(scanner.Bytes(), &e); err != nil {
 			log.Errorf("Error while unmarshalling event: %+v", e)
@@ -164,7 +154,7 @@ func listenForDockerEvents(eventQueue *containerEvents, reader io.ReadCloser) {
 				"event":               e.Status,
 				logfields.ContainerID: shortContainerID(e.ID),
 			}).Debug("Queueing container event")
-			eventQueue.enqueueByContainerID(e)
+			ws.enqueueByContainerID(e)
 		}
 	}
 
